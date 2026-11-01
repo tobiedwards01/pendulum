@@ -75,6 +75,7 @@ class Autopilot:
         self.samples = []      # (time, theta1, omega1, theta2, omega2, u)
         self.x0 = sim.x        # where the trolley should be right now (glides towards the target)
         self.v_ref = 0.0       # how fast that reference point is moving
+        self.a_ref = 0.0       # ...and how fast it is speeding up
         self.target = sim.x    # where the user wants the trolley to end up
         self.b_est = None
 
@@ -88,10 +89,11 @@ class Autopilot:
         # fastest speed from which we can still stop in time, capped at TARGET_V
         v_want = math.copysign(min(TARGET_V, math.sqrt(2 * TARGET_A * abs(gap))), gap)
         dv = clip(v_want - self.v_ref, TARGET_A * dt)
+        self.a_ref = dv / dt
         self.v_ref += dv
         self.x0 += self.v_ref * dt
         if abs(gap) < 1e-4 and abs(self.v_ref) < 1e-3:
-            self.x0, self.v_ref = self.target, 0.0
+            self.x0, self.v_ref, self.a_ref = self.target, 0.0, 0.0
 
     def at_target(self):
         return self.x0 == self.target and self.v_ref == 0.0
@@ -125,13 +127,13 @@ class Autopilot:
         if self.mode == "balance":
             fell = abs(p1) > 0.7 or (sim.double and abs(p2) > 0.7)
             if not fell:
-                return self.lqr(sim, self.K_up, p1, p2)
+                return self.lqr(sim, self.K_up, p1, p2, g)
             self.mode = "settle" if sim.double else "swing"
 
         if not sim.double:   # single pendulum: energy pumping, then catch it
             if abs(p1) < CATCH_ANGLE and abs(sim.omega) < CATCH_W:
                 self.mode = "balance"
-                return self.lqr(sim, self.K_up, p1, p2)
+                return self.lqr(sim, self.K_up, p1, p2, g)
             return self.swing_up(sim, g, L1)
 
         # ----- double pendulum -----
@@ -150,7 +152,7 @@ class Autopilot:
         # settle
         if near_top:
             self.mode = "balance"
-            return self.lqr(sim, self.K_up, p1, p2)
+            return self.lqr(sim, self.K_up, p1, p2, g)
         if key in self.plans and self.at_target() and self.is_settled(sim, g, L1, L2):
             self.begin_follow(sim, self.plans[key])
             return self.follow(sim, dt) or 0.0
@@ -217,7 +219,7 @@ class Autopilot:
             u = SETTLE_K * momentum - 1.0 * (sim.x - self.x0) - 1.5 * (sim.v - self.v_ref)
             return clip(u, SWING_A)
         # nearly still: LQR around hanging down finishes the job and parks the trolley
-        return self.lqr(sim, self.K_down, wrap(sim.theta), wrap(sim.theta2))
+        return self.lqr(sim, self.K_down, wrap(sim.theta), wrap(sim.theta2), g, upright=False)
 
     def check_planner(self, key):
         """Start the background planner for this setup if needed, and collect its result."""
@@ -319,11 +321,14 @@ class Autopilot:
         P = solve_continuous_are(A, B, Q, R)
         return np.linalg.solve(R, B.T @ P).ravel()
 
-    def lqr(self, sim, K, p1, p2):
-        err = [sim.x - self.x0, sim.v - self.v_ref, p1, sim.omega]
+    def lqr(self, sim, K, p1, p2, g=9.81, upright=True):
+        # feedforward: to accelerate with the moving target, an upright pendulum has to lean
+        # forwards by atan(a / g), and the trolley has to accelerate at a
+        lean = -math.atan(self.a_ref / g) if upright else math.atan(self.a_ref / g)
+        err = [sim.x - self.x0, sim.v - self.v_ref, p1 - lean, sim.omega]
         if sim.double:
-            err += [p2, sim.omega2]
-        return clip(-float(np.dot(K, err)), MAX_A)
+            err += [p2 - lean, sim.omega2]
+        return clip(self.a_ref - float(np.dot(K, err)), MAX_A)
 
     # ---------- text for the on-screen status card ----------
     def status(self, sim, b1, b2):
