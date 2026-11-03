@@ -495,7 +495,7 @@ while running:
             elif autopilot.active and abs(event.pos[1] - RAIL_Y) < 45:
                 # click on the rail: send the trolley there (snapped to 0.1 m)
                 xw = cam_x + (event.pos[0] - W / 2) / SCALE
-                autopilot.set_target(round(xw, 1))
+                autopilot.set_target(round(xw, 1), sim)
         elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
             dragging_bob = 0
             for s in sliders:

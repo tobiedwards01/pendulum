@@ -27,7 +27,7 @@ import sys
 import tempfile
 
 import numpy as np
-from scipy.linalg import solve_continuous_are
+from scipy.linalg import expm, solve_continuous_are
 
 MAX_A = 25.0                   # autopilot trolley acceleration limit (m/s^2)
 MEASURE_TIME = 3.0             # seconds spent measuring the damping
@@ -41,6 +41,8 @@ CATCH_W = 6.0                  # ...and when spinning slower than this (rad/s)
 SETTLE_K = 1.5                 # how hard to take energy out when settling the double pendulum
 SETTLE_SWITCH = 0.2            # below this much swing energy, hand over to the hanging-down LQR
 POS_WEIGHT = 1.0               # how much the balancer cares about trolley position/speed
+PREVIEW_DT = 0.01              # time step for planning a balanced move to a target (s)
+PREVIEW_POS = 50.0             # how closely a balanced move should follow the smooth path
 TARGET_V = 1.2                 # top speed when moving to a new target position (m/s)
 TARGET_A = 1.0                 # how quickly it speeds up / slows down for a new target (m/s^2)
 
@@ -77,26 +79,99 @@ class Autopilot:
         self.v_ref = 0.0       # how fast that reference point is moving
         self.a_ref = 0.0       # ...and how fast it is speeding up
         self.target = sim.x    # where the user wants the trolley to end up
+        self.move = None       # smooth path from the old position to the target
+        self.preview = None    # planned balanced move (states and accelerations over time)
         self.b_est = None
 
-    def set_target(self, x):
+    def set_target(self, x, sim=None):
+        """Plan a smooth minimum-jerk path (a 5th-order polynomial) from where the reference is
+        now, including its current speed and acceleration, to the target, ending still."""
         self.target = x
+        x0, v0, a0 = self.x0, self.v_ref, self.a_ref
+        D = abs(x - x0)
+        # long enough that the peak speed and acceleration stay within the limits
+        T = max(1.875 * D / TARGET_V, math.sqrt(5.77 * D / TARGET_A), 1.0)
+        M = np.array([[T ** 3, T ** 4, T ** 5],
+                      [3 * T ** 2, 4 * T ** 3, 5 * T ** 4],
+                      [6 * T, 12 * T ** 2, 20 * T ** 3]])
+        rhs = np.array([x - x0 - v0 * T - a0 / 2 * T ** 2, -v0 - a0 * T, -a0])
+        c3, c4, c5 = np.linalg.solve(M, rhs)
+        self.move = {"c": (x0, v0, a0 / 2, c3, c4, c5), "T": T, "tau": 0.0}
+        self.preview = self.plan_preview(sim) if sim is not None and self.mode == "balance" else None
+
+    def plan_preview(self, sim):
+        """Preview tracking for a move while balancing.
+
+        A balanced pendulum can't just follow the trolley: to speed up, the trolley first has to
+        duck backwards so the pendulum leans forwards, and the reverse to stop. So we look ahead
+        along the whole smooth path, using the linear model of the upright pendulum, and solve
+        a finite-horizon LQR tracking problem. That gives the best trolley moves *and* the lean
+        to expect at every moment, which the balancer then follows.
+        """
+        A, B = self.A_up, self.B_up
+        n = A.shape[0]
+        dt = PREVIEW_DT
+        # exact discrete-time version of the linear model (acceleration held for each step)
+        M = expm(np.block([[A, B[:, None]], [np.zeros((1, n + 1))]]) * dt)
+        Ad, Bd = M[:n, :n], M[:n, n]
+
+        m = self.move
+        N = int((m["T"] + 3.0) / dt)          # carry on 3 s past the end so it settles
+        tau = np.minimum(np.arange(N + 1) * dt, m["T"])
+        c0, c1, c2, c3, c4, c5 = m["c"]
+        r = np.zeros((N + 1, n))
+        r[:, 0] = c0 + tau * (c1 + tau * (c2 + tau * (c3 + tau * (c4 + tau * c5)))) - sim.x
+        r[:, 1] = c1 + tau * (2 * c2 + tau * (3 * c3 + tau * (4 * c4 + tau * 5 * c5)))
+        r[tau >= m["T"], 1] = 0.0
+        Q = np.diag([PREVIEW_POS, 1, 200, 10, 200, 10] if n == 6 else [PREVIEW_POS, 1, 100, 10])
+        R = 0.05
+
+        # backward pass: value function x'Px + 2s'x, gains u = -K x + kff
+        P = Q.copy()
+        svec = -Q @ r[N]
+        Ks = np.zeros((N, n))
+        kff = np.zeros(N)
+        for k in range(N - 1, -1, -1):
+            PB = P @ Bd
+            den = R + Bd @ PB
+            K = (PB @ Ad) / den
+            kf = -(Bd @ svec) / den
+            Acl = Ad - np.outer(Bd, K)
+            svec = Acl.T @ (PB * kf + svec) - R * kf * K - Q @ r[k]
+            P = Q + Ad.T @ P @ Acl
+            P = 0.5 * (P + P.T)
+            Ks[k], kff[k] = K, kf
+
+        # forward pass: the planned states and accelerations, starting from how it is now
+        xs = np.zeros((N + 1, n))
+        us = np.zeros(N)
+        p1, p2 = wrap(sim.theta - math.pi), wrap(sim.theta2 - math.pi)
+        xs[0] = [0.0, sim.v, p1, sim.omega] + ([p2, sim.omega2] if n == 6 else [])
+        for k in range(N):
+            us[k] = -Ks[k] @ xs[k] + kff[k]
+            xs[k + 1] = Ad @ xs[k] + Bd * us[k]
+        return {"xs": xs, "us": us, "dt": dt, "x_start": sim.x, "tau": 0.0}
 
     def move_reference(self, dt):
-        """Glide the reference point towards the target with limited speed and acceleration,
-        like a smooth motion profile, so the pendulum is never asked to jump."""
-        gap = self.target - self.x0
-        # fastest speed from which we can still stop in time, capped at TARGET_V
-        v_want = math.copysign(min(TARGET_V, math.sqrt(2 * TARGET_A * abs(gap))), gap)
-        dv = clip(v_want - self.v_ref, TARGET_A * dt)
-        self.a_ref = dv / dt
-        self.v_ref += dv
-        self.x0 += self.v_ref * dt
-        if abs(gap) < 1e-4 and abs(self.v_ref) < 1e-3:
+        """Step the reference point along the planned path towards the target."""
+        if self.preview is not None:
+            self.preview["tau"] += dt
+            if self.preview["tau"] >= len(self.preview["us"]) * self.preview["dt"]:
+                self.preview = None
+        if self.move is None:
+            return
+        m = self.move
+        m["tau"] = tau = min(m["tau"] + dt, m["T"])
+        c0, c1, c2, c3, c4, c5 = m["c"]
+        self.x0 = c0 + tau * (c1 + tau * (c2 + tau * (c3 + tau * (c4 + tau * c5))))
+        self.v_ref = c1 + tau * (2 * c2 + tau * (3 * c3 + tau * (4 * c4 + tau * 5 * c5)))
+        self.a_ref = 2 * c2 + tau * (6 * c3 + tau * (12 * c4 + tau * 20 * c5))
+        if tau >= m["T"]:
             self.x0, self.v_ref, self.a_ref = self.target, 0.0, 0.0
+            self.move = None
 
     def at_target(self):
-        return self.x0 == self.target and self.v_ref == 0.0
+        return self.move is None
 
     def stop(self):
         self.active = False
@@ -116,6 +191,8 @@ class Autopilot:
         self.t += dt
         if self.mode == "measure":
             return self.measure(sim, dt, g, L1, L2)
+        if self.mode != "balance":
+            self.preview = None      # the planned balanced move only makes sense while balancing
         if self.mode != "follow":    # the swing-up plan needs a fixed home, so don't move it then
             self.move_reference(dt)
 
@@ -127,13 +204,13 @@ class Autopilot:
         if self.mode == "balance":
             fell = abs(p1) > 0.7 or (sim.double and abs(p2) > 0.7)
             if not fell:
-                return self.lqr(sim, self.K_up, p1, p2, g)
+                return self.lqr(sim, self.K_up, p1, p2)
             self.mode = "settle" if sim.double else "swing"
 
         if not sim.double:   # single pendulum: energy pumping, then catch it
             if abs(p1) < CATCH_ANGLE and abs(sim.omega) < CATCH_W:
                 self.mode = "balance"
-                return self.lqr(sim, self.K_up, p1, p2, g)
+                return self.lqr(sim, self.K_up, p1, p2)
             return self.swing_up(sim, g, L1)
 
         # ----- double pendulum -----
@@ -152,7 +229,7 @@ class Autopilot:
         # settle
         if near_top:
             self.mode = "balance"
-            return self.lqr(sim, self.K_up, p1, p2, g)
+            return self.lqr(sim, self.K_up, p1, p2)
         if key in self.plans and self.at_target() and self.is_settled(sim, g, L1, L2):
             self.begin_follow(sim, self.plans[key])
             return self.follow(sim, dt) or 0.0
@@ -219,7 +296,7 @@ class Autopilot:
             u = SETTLE_K * momentum - 1.0 * (sim.x - self.x0) - 1.5 * (sim.v - self.v_ref)
             return clip(u, SWING_A)
         # nearly still: LQR around hanging down finishes the job and parks the trolley
-        return self.lqr(sim, self.K_down, wrap(sim.theta), wrap(sim.theta2), g, upright=False)
+        return self.lqr(sim, self.K_down, wrap(sim.theta), wrap(sim.theta2), upright=False)
 
     def check_planner(self, key):
         """Start the background planner for this setup if needed, and collect its result."""
@@ -318,17 +395,25 @@ class Autopilot:
         else:
             Q = np.diag([4, 4, 20, 2, 20, 2])
             R = np.array([[0.2]])
+        if upright:
+            self.A_up, self.B_up = A, B.ravel()   # kept for planning balanced moves
         P = solve_continuous_are(A, B, Q, R)
         return np.linalg.solve(R, B.T @ P).ravel()
 
-    def lqr(self, sim, K, p1, p2, g=9.81, upright=True):
-        # feedforward: to accelerate with the moving target, an upright pendulum has to lean
-        # forwards by atan(a / g), and the trolley has to accelerate at a
-        lean = -math.atan(self.a_ref / g) if upright else math.atan(self.a_ref / g)
-        err = [sim.x - self.x0, sim.v - self.v_ref, p1 - lean, sim.omega]
-        if sim.double:
-            err += [p2 - lean, sim.omega2]
-        return clip(self.a_ref - float(np.dot(K, err)), MAX_A)
+    def lqr(self, sim, K, p1, p2, upright=True):
+        state = [sim.x, sim.v, p1, sim.omega] + ([p2, sim.omega2] if sim.double else [])
+        pv = self.preview if upright else None
+        if pv is not None:
+            # follow the planned balanced move: planned state (including lean) + planned acceleration
+            k = min(int(pv["tau"] / pv["dt"]), len(pv["us"]) - 1)
+            ref = pv["xs"][k].copy()
+            ref[0] += pv["x_start"]
+            u_ff = pv["us"][k]
+        else:
+            ref = [self.x0, self.v_ref, 0.0, 0.0] + ([0.0, 0.0] if sim.double else [])
+            u_ff = 0.0
+        err = np.subtract(state, ref)
+        return clip(u_ff - float(np.dot(K, err)), MAX_A)
 
     # ---------- text for the on-screen status card ----------
     def status(self, sim, b1, b2):
